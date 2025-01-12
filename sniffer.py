@@ -1,119 +1,90 @@
-from scapy.all import sniff, ARP, IP, Raw, TCP, get_if_list, get_if_addr
-from scapy.layers.dot11 import Dot11, Dot11Beacon
-from collections import defaultdict
-from colorama import Fore, Style, init
+import socket
 import logging
+from scapy.all import sniff, ARP, IP, Raw, get_if_list, get_if_addr, get_if_hwaddr, conf
+from colorama import Fore, Style, init
+from collections import defaultdict
 
 # Initialize colorama for colored output
 init(autoreset=True)
 
-# Setup logging
-logging.basicConfig(filename="network_events.log", level=logging.INFO, format="%(asctime)s - %(message)s")
+# Get the local IP address
+local_ip = socket.gethostbyname(socket.gethostname())
 
-# Global variables for tracking
-arp_table = {}
-ip_count = defaultdict(int)
-port_scan_count = defaultdict(int)
+# Initialize a dictionary to keep track of packet counts per IP (for DoS detection)
+packet_counter = defaultdict(int)
+threshold = 100  # Set threshold for DoS detection
+
+# Configure logging
+logging.basicConfig(filename='packet_sniffer.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def list_interfaces():
-    """List all available network interfaces with descriptions."""
+    """List all available network interfaces with additional details."""
     print(f"{Fore.CYAN}Available network interfaces:{Style.RESET_ALL}")
     interfaces = get_if_list()
-    
     for idx, interface in enumerate(interfaces):
-        # Try to get an IP address for the interface
         try:
-            ip_address = get_if_addr(interface)
-        except:
-            ip_address = "N/A"
-        
-        # Classify interface type
-        if "Wi-Fi" in interface or "wlan" in interface.lower():
-            interface_type = "Wi-Fi"
-        elif "Ethernet" in interface or "eth" in interface.lower():
-            interface_type = "Ethernet"
-        elif "Loopback" in interface or "lo" in interface.lower():
-            interface_type = "Loopback"
-        else:
-            interface_type = "Virtual or Unknown"
-        
-        print(f"{Fore.GREEN}[{idx}] {interface} ({interface_type}) - IP: {ip_address}{Style.RESET_ALL}")
-    
+            # Get IP and MAC address of the interface
+            interface_ip = get_if_addr(interface)
+            interface_mac = get_if_hwaddr(interface)
+            # Determine if it's a Wi-Fi, Ethernet, or Virtual interface based on the interface name
+            interface_type = "Wi-Fi" if "Wi-Fi" in interface else "Ethernet" if "Ethernet" in interface else "Virtual"
+            print(f"{Fore.GREEN}[{idx}] {interface} - IP: {interface_ip} - MAC: {interface_mac} - Type: {interface_type}{Style.RESET_ALL}")
+        except Exception as e:
+            print(f"{Fore.RED}[ERROR] Failed to get details for {interface}: {e}{Style.RESET_ALL}")
     return interfaces
 
 def detect_arp_spoof(packet):
-    """Detect ARP spoofing attacks by comparing MAC addresses."""
-    if packet.haslayer(ARP) and packet[ARP].op == 2:  # ARP Reply
-        ip_src = packet[ARP].psrc
-        mac_src = packet[ARP].hwsrc
-        
-        if ip_src in arp_table:
-            if arp_table[ip_src] != mac_src:
-                print(f"{Fore.RED}[ALERT] ARP Spoofing detected! IP: {ip_src}, Fake MAC: {mac_src}{Style.RESET_ALL}")
-                log_event(f"ARP Spoofing detected! IP: {ip_src}, Fake MAC: {mac_src}")
-        else:
-            arp_table[ip_src] = mac_src
+    """Detect potential ARP spoofing attacks."""
+    if packet.haslayer(ARP):
+        if packet[ARP].op == 2:  # ARP Reply
+            alert_msg = f"ARP Spoofing detected! Source IP: {packet[ARP].psrc}, Fake MAC: {packet[ARP].hwsrc}"
+            print(f"{Fore.RED}[ALERT] {alert_msg}{Style.RESET_ALL}")
+            logging.warning(alert_msg)
 
-def detect_dos(packet):
-    """Detect potential Denial of Service (DoS) attacks."""
+def detect_dos_attack(packet):
+    """Detect potential DoS (Denial of Service) attacks."""
     if packet.haslayer(IP):
         ip_src = packet[IP].src
-        ip_count[ip_src] += 1
-        if ip_count[ip_src] > 100:  # Threshold can be adjusted
-            print(f"{Fore.RED}[ALERT] Possible DoS attack detected from {ip_src}{Style.RESET_ALL}")
-            log_event(f"Possible DoS attack detected from {ip_src}")
 
-def detect_port_scanning(packet):
-    """Detect potential port scanning attempts."""
-    if packet.haslayer(TCP) and packet[TCP].flags == "S":  # TCP SYN packet
-        ip_dst = packet[IP].dst
-        port_dst = packet[TCP].dport
-        port_scan_count[ip_dst] += 1
-        if port_scan_count[ip_dst] > 5:  # Threshold can be adjusted
-            print(f"{Fore.RED}[ALERT] Possible port scanning detected on {ip_dst} targeting port {port_dst}{Style.RESET_ALL}")
-            log_event(f"Possible port scanning detected on {ip_dst} targeting port {port_dst}")
+        # Ignore packets from the local machine
+        if ip_src == local_ip:
+            return
 
-def detect_open_network(packet):
-    """Detect open Wi-Fi networks (no encryption)."""
-    if packet.haslayer(Dot11Beacon):
-        ssid = packet[Dot11].info.decode(errors='ignore')
-        encryption = packet[Dot11Beacon].capabilities
-        if 'privacy' not in encryption:  # If 'privacy' is not in capabilities, it's open
-            print(f"{Fore.YELLOW}[INFO] Open Wi-Fi network detected: {ssid}{Style.RESET_ALL}")
-            log_event(f"Open Wi-Fi network detected: {ssid}")
+        # Track packet count for each source IP (Detect DoS behavior)
+        packet_counter[ip_src] += 1
 
-def detect_http_https(packet):
-    """Detect potential sensitive data in HTTP/HTTPS traffic."""
-    if packet.haslayer(Raw):
-        raw_data = packet[Raw].load.decode(errors='ignore')
-        if packet.haslayer(IP):
-            ip_src = packet[IP].src
-            ip_dst = packet[IP].dst
-            if "HTTP" in raw_data:
-                if "password" in raw_data or "username" in raw_data:
-                    print(f"{Fore.YELLOW}[INFO] Potential sensitive data in HTTP traffic: {raw_data} from {ip_src} -> {ip_dst}{Style.RESET_ALL}")
-                    log_event(f"Potential sensitive data in HTTP traffic: {raw_data} from {ip_src} -> {ip_dst}")
+        # If a source IP exceeds the threshold, flag it as a potential DoS attack
+        if packet_counter[ip_src] > threshold:
+            alert_msg = f"Possible DoS attack detected from IP: {ip_src}"
+            print(f"{Fore.RED}[ALERT] {alert_msg}{Style.RESET_ALL}")
+            logging.warning(alert_msg)
 
 def analyze_packet(packet):
     """Analyze captured packets."""
     try:
-        # Detect sensitive data in HTTP/HTTPS traffic
-        detect_http_https(packet)
+        # Detect potential sensitive data (e.g., passwords or login information)
+        if packet.haslayer(Raw):  # Check for raw data
+            raw_data = packet[Raw].load.decode(errors='ignore')
+            if "password" in raw_data or "login" in raw_data:
+                info_msg = f"Potential sensitive data detected: {raw_data}"
+                print(f"{Fore.YELLOW}[INFO] {info_msg}{Style.RESET_ALL}")
+                logging.info(info_msg)
 
-        # Detect Denial of Service (DoS) attacks
-        detect_dos(packet)
+        if packet.haslayer(IP):
+            ip_src = packet[IP].src
+            ip_dst = packet[IP].dst
+            info_msg = f"Packet: {ip_src} -> {ip_dst}"
+            print(f"{Fore.CYAN}[INFO] {info_msg}{Style.RESET_ALL}")
+            logging.info(info_msg)
 
-        # Detect port scanning
-        detect_port_scanning(packet)
-
-        # Detect ARP spoofing
+        # Detect ARP spoofing and DoS attacks
         detect_arp_spoof(packet)
+        detect_dos_attack(packet)
 
-        # Detect open Wi-Fi networks
-        detect_open_network(packet)
-        
     except Exception as e:
-        print(f"{Fore.RED}[ERROR] Failed to process packet: {e}{Style.RESET_ALL}")
+        error_msg = f"Failed to process packet: {e}"
+        print(f"{Fore.RED}[ERROR] {error_msg}{Style.RESET_ALL}")
+        logging.error(error_msg)
 
 def capture_packets(interface):
     """Capture packets on a specified network interface."""
@@ -121,13 +92,13 @@ def capture_packets(interface):
     try:
         sniff(iface=interface, prn=analyze_packet, store=False)
     except PermissionError:
-        print(f"{Fore.RED}[ERROR] Permission denied. Try running as administrator/root.{Style.RESET_ALL}")
+        error_msg = "[ERROR] Permission denied. Try running as administrator/root."
+        print(f"{Fore.RED}{error_msg}{Style.RESET_ALL}")
+        logging.error(error_msg)
     except Exception as e:
-        print(f"{Fore.RED}[ERROR] Failed to start sniffer: {e}{Style.RESET_ALL}")
-
-def log_event(event_message):
-    """Log event to a file."""
-    logging.info(event_message)
+        error_msg = f"[ERROR] Failed to start sniffer: {e}"
+        print(f"{Fore.RED}{error_msg}{Style.RESET_ALL}")
+        logging.error(error_msg)
 
 def main():
     print(f"{Fore.CYAN}Packet Sniffer - Starting...{Style.RESET_ALL}")
@@ -148,6 +119,7 @@ def main():
         print(f"{Fore.RED}Invalid input. Please enter a valid number.{Style.RESET_ALL}")
     except Exception as e:
         print(f"{Fore.RED}[ERROR] {e}{Style.RESET_ALL}")
+        logging.error(f"Error: {e}")
 
 if __name__ == "__main__":
     main()
